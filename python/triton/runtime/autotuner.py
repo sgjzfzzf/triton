@@ -2,10 +2,12 @@ from __future__ import annotations
 from abc import abstractmethod
 
 import builtins
+from collections import defaultdict
 import os
 import time
 import inspect
-from typing import Any, Dict, Tuple
+import random
+from typing import Any, Dict, List, Set, Tuple, Union
 
 from .jit import KernelInterface
 from .errors import OutOfResources
@@ -315,6 +317,100 @@ class Autotuner(BaseAutotuner):
         return ret
 
 
+class StepwiseAutotuner(BaseAutotuner):
+    def __init__(
+        self,
+        fn,
+        arg_names,
+        configs,
+        key,
+        reset_to_zero,
+        restore_value,
+        pre_hook=None,
+        post_hook=None,
+        prune_configs_by=None,
+        warmup=None,
+        rep=None,
+        use_cuda_graph=False,
+        do_bench=None,
+        min_try=5,
+    ):
+        super().__init__(
+            fn,
+            arg_names,
+            configs,
+            key,
+            reset_to_zero,
+            restore_value,
+            pre_hook,
+            post_hook,
+            prune_configs_by,
+            warmup,
+            rep,
+            use_cuda_graph,
+            do_bench,
+        )
+        self._min_try: int = min_try
+        self._tcache: Dict[Tuple[Any], Union[Config, Dict[Config, List[int]]]] = (
+            defaultdict(lambda: defaultdict(list))
+        )
+
+    def run(self, *args, **kwargs):
+        self.nargs = dict(zip(self.arg_names, args))
+        key = self._get_key({**self.nargs, **kwargs})
+        cache: Union[Config, Dict[Config, List[int]], None] = self._tcache[key]
+        ret = None
+        while ret == None:
+            if isinstance(cache, Config):
+                config: Config = cache
+            else:
+                pruned_configs: Set[Config] = {*self.prune_configs(kwargs)}
+                configs = [
+                    config
+                    for config in pruned_configs
+                    if cache[config] is not None
+                    and (config not in cache or len(cache[config]) < self._min_try)
+                ]
+                if configs:
+                    config: Config = random.choice(configs)
+                else:
+                    config = min(
+                        (k for k, v in cache.items() if v is not None),
+                        key=lambda c: sum(cache[c]) / len(cache[c]),
+                    )
+                    cache = config
+                    self._tcache[key] = cache
+            if config.pre_hook is not None:
+                full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
+                config.pre_hook(full_nargs)
+            di = driver.active.get_device_interface()
+            start_event = di.Event(enable_timing=True)
+            end_event = di.Event(enable_timing=True)
+            start_event.record()
+            try:
+                ret = self.fn.run(
+                    *args,
+                    **kwargs,
+                    **config.all_kwargs(),
+                )
+            except OutOfResources:
+                if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
+                    print(
+                        f"Triton autotuning for function `{self.base_fn.__name__}` failed on config `{config}` with args `{[(k, self.nargs[k]) for k in self.keys]}`"
+                    )
+                ret = None
+            end_event.record()
+            di.synchronize()
+            timecost = end_event.elapsed_time(start_event)
+            if isinstance(cache, defaultdict):
+                if ret:
+                    self._tcache[key][config].append(timecost)
+                else:
+                    self._tcache[key][config] = None
+        self.nargs = None
+        return ret
+
+
 class Config:
     """
     An object that represents a possible kernel configuration for the auto-tuner to try.
@@ -462,21 +558,39 @@ def autotune(
     :type do_bench: lambda fn, quantiles
     """
 
-    def decorator(fn):
-        return Autotuner(
-            fn,
-            fn.arg_names,
-            configs,
-            key,
-            reset_to_zero,
-            restore_value,
-            pre_hook=pre_hook,
-            post_hook=post_hook,
-            prune_configs_by=prune_configs_by,
-            warmup=warmup,
-            rep=rep,
-            use_cuda_graph=use_cuda_graph,
-        )
+    def decorator(fn, autotuner: str = "autotuner"):
+        if autotuner == "autotuner":
+            return Autotuner(
+                fn,
+                fn.arg_names,
+                configs,
+                key,
+                reset_to_zero,
+                restore_value,
+                pre_hook=pre_hook,
+                post_hook=post_hook,
+                prune_configs_by=prune_configs_by,
+                warmup=warmup,
+                rep=rep,
+                use_cuda_graph=use_cuda_graph,
+            )
+        elif autotuner == "stepwise":
+            return StepwiseAutotuner(
+                fn,
+                fn.arg_names,
+                configs,
+                key,
+                reset_to_zero,
+                restore_value,
+                pre_hook=pre_hook,
+                post_hook=post_hook,
+                prune_configs_by=prune_configs_by,
+                warmup=warmup,
+                rep=rep,
+                use_cuda_graph=use_cuda_graph,
+            )
+        else:
+            raise NotImplementedError(f"Autotuner {autotuner} not implemented.")
 
     return decorator
 
