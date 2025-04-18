@@ -2,12 +2,13 @@ from __future__ import annotations
 from abc import abstractmethod
 
 import builtins
-from collections import defaultdict
 import os
 import time
 import inspect
 import random
-from typing import Any, Dict, List, Set, Tuple, Union
+import sys
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from .jit import KernelInterface
 from .errors import OutOfResources
@@ -356,18 +357,18 @@ class StepwiseAutotuner(BaseAutotuner):
         )
 
     def run(self, *args, **kwargs):
-        self.nargs = dict(zip(self.arg_names, args))
-        key = self._get_key({**self.nargs, **kwargs})
+        self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
+        key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
         cache: Union[Config, Dict[Config, List[int]], None] = self._tcache[key]
         ret = None
         while ret == None:
-            if isinstance(cache, Config):
+            isconfig: bool = isinstance(cache, Config)
+            if isconfig:
                 config: Config = cache
             else:
-                pruned_configs: Set[Config] = {*self.prune_configs(kwargs)}
                 configs = [
                     config
-                    for config in pruned_configs
+                    for config in self.prune_configs(kwargs)
                     if cache[config] is not None
                     and (config not in cache or len(cache[config]) < self._min_try)
                 ]
@@ -378,15 +379,16 @@ class StepwiseAutotuner(BaseAutotuner):
                         (k for k, v in cache.items() if v is not None),
                         key=lambda c: sum(cache[c]) / len(cache[c]),
                     )
-                    cache = config
-                    self._tcache[key] = cache
+                    self._tcache[key] = config
+                    isconfig = True
             if config.pre_hook is not None:
                 full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
                 config.pre_hook(full_nargs)
-            di = driver.active.get_device_interface()
-            start_event = di.Event(enable_timing=True)
-            end_event = di.Event(enable_timing=True)
-            start_event.record()
+            if not isconfig:
+                di = driver.active.get_device_interface()
+                start_event = di.Event(enable_timing=True)
+                end_event = di.Event(enable_timing=True)
+                start_event.record()
             try:
                 ret = self.fn.run(
                     *args,
@@ -395,20 +397,126 @@ class StepwiseAutotuner(BaseAutotuner):
                 )
             except OutOfResources:
                 if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
+                    args_display: List[Tuple[str, Any]] = [
+                        (k, self.nargs[k]) for k in self.keys
+                    ]
                     print(
-                        f"Triton autotuning for function `{self.base_fn.__name__}` failed on config `{config}` with args `{[(k, self.nargs[k]) for k in self.keys]}`"
+                        f"Triton autotuning for function `{self.base_fn.__name__}` failed on config `{config}` with args `{args_display}`"
                     )
                 ret = None
-            end_event.record()
-            di.synchronize()
-            timecost = end_event.elapsed_time(start_event)
-            if isinstance(cache, defaultdict):
+            if not isconfig:
+                end_event.record()
+                di.synchronize()
+                timecost: float = end_event.elapsed_time(start_event)
                 if ret:
                     self._tcache[key][config].append(timecost)
                 else:
                     self._tcache[key][config] = None
         self.nargs = None
         return ret
+
+
+class EpsilonAutotuner(BaseAutotuner):
+    def __init__(
+        self,
+        fn,
+        arg_names,
+        configs,
+        key,
+        reset_to_zero,
+        restore_value,
+        pre_hook=None,
+        post_hook=None,
+        prune_configs_by=None,
+        warmup=None,
+        rep=None,
+        use_cuda_graph=False,
+        do_bench=None,
+        epsilon=1.0,
+        decay=0.001,
+    ):
+        super().__init__(
+            fn,
+            arg_names,
+            configs,
+            key,
+            reset_to_zero,
+            restore_value,
+            pre_hook,
+            post_hook,
+            prune_configs_by,
+            warmup,
+            rep,
+            use_cuda_graph,
+            do_bench,
+        )
+        self._epsilon: float = epsilon
+        self._decay: float = decay
+        self._tcache: Dict[Tuple[Any], Tuple[Config, float, float]] = {}
+
+    def run(self, *args, **kwargs):
+        self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
+        key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
+        ret = None
+        while ret == None:
+            if key in self._tcache:
+                candidate, epsilon, perf = self._tcache[key]
+                if random.random() < epsilon:
+                    is_explore: bool = True
+                else:
+                    is_explore: bool = False
+            else:
+                is_explore: bool = True
+                candidate: Optional[Config] = None
+                epsilon: float = self._epsilon
+                perf: float = sys.float_info.max
+            config: Optional[Config] = None
+            if is_explore:
+                configs = [
+                    config
+                    for config in self.prune_configs(kwargs)
+                    if config is not candidate
+                ]
+                if configs:
+                    config: Config = random.choice(configs)
+            if config is None:
+                config: Config = candidate
+            if config.pre_hook is not None:
+                full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
+                config.pre_hook(full_nargs)
+            if is_explore:
+                di = driver.active.get_device_interface()
+                start_event = di.Event(enable_timing=True)
+                end_event = di.Event(enable_timing=True)
+                start_event.record()
+            try:
+                ret = self.fn.run(
+                    *args,
+                    **kwargs,
+                    **config.all_kwargs(),
+                )
+            except OutOfResources:
+                if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
+                    args_display: List[Tuple[str, Any]] = [
+                        (k, self.nargs[k]) for k in self.keys
+                    ]
+                    print(
+                        f"Triton autotuning for function `{self.base_fn.__name__}` failed on config `{config}` with args `{args_display}`"
+                    )
+                ret = None
+            if ret is not None:
+                if is_explore:
+                    end_event.record()
+                    di.synchronize()
+                    timecost: float = end_event.elapsed_time(start_event)
+                    if perf > timecost:
+                        candidate = config
+                        epsilon = self._epsilon
+                        perf = timecost
+                    else:
+                        epsilon = epsilon * (1 - self._decay)
+                    self._tcache[key] = (candidate, epsilon, perf)
+                return ret
 
 
 class Config:
@@ -576,6 +684,21 @@ def autotune(
             )
         elif autotuner == "stepwise":
             return StepwiseAutotuner(
+                fn,
+                fn.arg_names,
+                configs,
+                key,
+                reset_to_zero,
+                restore_value,
+                pre_hook=pre_hook,
+                post_hook=post_hook,
+                prune_configs_by=prune_configs_by,
+                warmup=warmup,
+                rep=rep,
+                use_cuda_graph=use_cuda_graph,
+            )
+        elif autotuner == "epsilon":
+            return EpsilonAutotuner(
                 fn,
                 fn.arg_names,
                 configs,
