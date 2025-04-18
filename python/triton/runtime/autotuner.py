@@ -6,9 +6,10 @@ import os
 import time
 import inspect
 import random
+import statistics
 import sys
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .jit import KernelInterface
 from .errors import OutOfResources
@@ -334,7 +335,7 @@ class StepwiseAutotuner(BaseAutotuner):
         rep=None,
         use_cuda_graph=False,
         do_bench=None,
-        min_try=5,
+        min_try: int = 20,
     ):
         super().__init__(
             fn,
@@ -352,14 +353,14 @@ class StepwiseAutotuner(BaseAutotuner):
             do_bench,
         )
         self._min_try: int = min_try
-        self._tcache: Dict[Tuple[Any], Union[Config, Dict[Config, List[int]]]] = (
-            defaultdict(lambda: defaultdict(list))
-        )
+        self._tcache: Dict[
+            Tuple[Any], Optional[Union[Config, Dict[Config, List[int]]]]
+        ] = defaultdict(lambda: defaultdict(list))
 
     def run(self, *args, **kwargs):
         self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
         key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
-        cache: Union[Config, Dict[Config, List[int]], None] = self._tcache[key]
+        cache: Optional[Union[Config, Dict[Config, List[int]]]] = self._tcache[key]
         ret = None
         while ret == None:
             isconfig: bool = isinstance(cache, Config)
@@ -432,8 +433,8 @@ class EpsilonAutotuner(BaseAutotuner):
         rep=None,
         use_cuda_graph=False,
         do_bench=None,
-        epsilon=1.0,
-        decay=0.001,
+        epsilon: float = 1.0,
+        decay: float = 0.001,
     ):
         super().__init__(
             fn,
@@ -517,6 +518,128 @@ class EpsilonAutotuner(BaseAutotuner):
                         epsilon = epsilon * (1 - self._decay)
                     self._tcache[key] = (candidate, epsilon, perf)
                 return ret
+
+
+class ConfidenceAutotuner(BaseAutotuner):
+    def __init__(
+        self,
+        fn,
+        arg_names,
+        configs,
+        key,
+        reset_to_zero,
+        restore_value,
+        pre_hook=None,
+        post_hook=None,
+        prune_configs_by=None,
+        warmup=None,
+        rep=None,
+        use_cuda_graph=False,
+        do_bench=None,
+        ratio: float = 3.0,
+    ):
+        super().__init__(
+            fn,
+            arg_names,
+            configs,
+            key,
+            reset_to_zero,
+            restore_value,
+            pre_hook,
+            post_hook,
+            prune_configs_by,
+            warmup,
+            rep,
+            use_cuda_graph,
+            do_bench,
+        )
+        self._ratio: float = ratio
+        self._tcache: Dict[
+            Tuple[Any], Optional[Union[Config, Dict[Config, List[int]]]]
+        ] = defaultdict(lambda: defaultdict(list))
+
+    def run(self, *args, **kwargs):
+        self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
+        key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
+        cache: Optional[Union[Config, Dict[Config, List[int]]]] = self._tcache[key]
+        ret = None
+        while ret == None:
+            isconfig: bool = isinstance(cache, Config)
+            if isconfig:
+                config: Config = cache
+            else:
+                configs = [
+                    config
+                    for config in self.prune_configs(kwargs)
+                    if cache[config] is not None
+                ]
+
+                def _get_boundary(
+                    timelist: List[int], op: Callable[[float, float], float]
+                ) -> float:
+                    if timelist:
+                        mean: float = statistics.mean(timelist)
+                    else:
+                        mean: float = sys.float_info.max
+                    if len(timelist) > 1:
+                        variance: float = statistics.variance(timelist)
+                    elif len(timelist) == 1:
+                        variance: float = sys.float_info.max
+                    else:
+                        variance: float = 0.0
+                    return op(mean, self._ratio * variance)
+
+                def _get_upper_boundary(timelist: List[int]) -> float:
+                    return _get_boundary(timelist, lambda x, y: x + y)
+
+                def _get_lower_boundary(timelist: List[int]) -> float:
+                    return _get_boundary(timelist, lambda x, y: x - y)
+
+                config: Config = builtins.min(
+                    configs,
+                    key=lambda c: _get_lower_boundary(cache[c]),
+                )
+                config_upper_boundary: float = _get_upper_boundary(cache[config])
+                if all(
+                    _get_lower_boundary(v) >= config_upper_boundary
+                    for k, v in cache.items()
+                    if k != config
+                ):
+                    self._tcache[key] = config
+                    isconfig = True
+            if config.pre_hook is not None:
+                full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
+                config.pre_hook(full_nargs)
+            if not isconfig:
+                di = driver.active.get_device_interface()
+                start_event = di.Event(enable_timing=True)
+                end_event = di.Event(enable_timing=True)
+                start_event.record()
+            try:
+                ret = self.fn.run(
+                    *args,
+                    **kwargs,
+                    **config.all_kwargs(),
+                )
+            except OutOfResources:
+                if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
+                    args_display: List[Tuple[str, Any]] = [
+                        (k, self.nargs[k]) for k in self.keys
+                    ]
+                    print(
+                        f"Triton autotuning for function `{self.base_fn.__name__}` failed on config `{config}` with args `{args_display}`"
+                    )
+                ret = None
+            if not isconfig:
+                end_event.record()
+                di.synchronize()
+                timecost: float = end_event.elapsed_time(start_event)
+                if ret:
+                    self._tcache[key][config].append(timecost)
+                else:
+                    self._tcache[key][config] = None
+        self.nargs = None
+        return ret
 
 
 class Config:
@@ -699,6 +822,21 @@ def autotune(
             )
         elif autotuner == "epsilon":
             return EpsilonAutotuner(
+                fn,
+                fn.arg_names,
+                configs,
+                key,
+                reset_to_zero,
+                restore_value,
+                pre_hook=pre_hook,
+                post_hook=post_hook,
+                prune_configs_by=prune_configs_by,
+                warmup=warmup,
+                rep=rep,
+                use_cuda_graph=use_cuda_graph,
+            )
+        elif autotuner == "confidence":
+            return ConfidenceAutotuner(
                 fn,
                 fn.arg_names,
                 configs,
