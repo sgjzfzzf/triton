@@ -789,9 +789,9 @@ def autotune(
     :type do_bench: lambda fn, quantiles
     """
 
-    def decorator(fn, autotuner: str = "autotuner"):
+    def decorator(fn, autotuner: str = "default"):
         autotune_dispatch: Dict[str, Callable] = {
-            "autotuner": Autotuner,
+            "default": Autotuner,
             "stepwise": StepwiseAutotuner,
             "epsilon": EpsilonAutotuner,
             "confidence": ConfidenceAutotuner,
