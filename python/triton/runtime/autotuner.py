@@ -790,65 +790,27 @@ def autotune(
     """
 
     def decorator(fn, autotuner: str = "autotuner"):
-        if autotuner == "autotuner":
-            return Autotuner(
+        autotune_dispatch: Dict[str, Callable] = {
+            "autotuner": Autotuner,
+            "stepwise": StepwiseAutotuner,
+            "epsilon": EpsilonAutotuner,
+            "confidence": ConfidenceAutotuner,
+        }
+        autotuner: Callable = autotune_dispatch.get(autotuner)
+        if autotuner:
+            return autotuner(
                 fn,
                 fn.arg_names,
                 configs,
                 key,
                 reset_to_zero,
                 restore_value,
-                pre_hook=pre_hook,
-                post_hook=post_hook,
-                prune_configs_by=prune_configs_by,
-                warmup=warmup,
-                rep=rep,
-                use_cuda_graph=use_cuda_graph,
-            )
-        elif autotuner == "stepwise":
-            return StepwiseAutotuner(
-                fn,
-                fn.arg_names,
-                configs,
-                key,
-                reset_to_zero,
-                restore_value,
-                pre_hook=pre_hook,
-                post_hook=post_hook,
-                prune_configs_by=prune_configs_by,
-                warmup=warmup,
-                rep=rep,
-                use_cuda_graph=use_cuda_graph,
-            )
-        elif autotuner == "epsilon":
-            return EpsilonAutotuner(
-                fn,
-                fn.arg_names,
-                configs,
-                key,
-                reset_to_zero,
-                restore_value,
-                pre_hook=pre_hook,
-                post_hook=post_hook,
-                prune_configs_by=prune_configs_by,
-                warmup=warmup,
-                rep=rep,
-                use_cuda_graph=use_cuda_graph,
-            )
-        elif autotuner == "confidence":
-            return ConfidenceAutotuner(
-                fn,
-                fn.arg_names,
-                configs,
-                key,
-                reset_to_zero,
-                restore_value,
-                pre_hook=pre_hook,
-                post_hook=post_hook,
-                prune_configs_by=prune_configs_by,
-                warmup=warmup,
-                rep=rep,
-                use_cuda_graph=use_cuda_graph,
+                pre_hook,
+                post_hook,
+                prune_configs_by,
+                warmup,
+                rep,
+                use_cuda_graph,
             )
         else:
             raise NotImplementedError(f"Autotuner {autotuner} not implemented.")
