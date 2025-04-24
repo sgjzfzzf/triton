@@ -789,14 +789,16 @@ def autotune(
     :type do_bench: lambda fn, quantiles
     """
 
-    def decorator(fn, autotuner: str = "default"):
+    def decorator(fn, autotune: Optional[str] = None):
         autotune_dispatch: Dict[str, Callable] = {
             "default": Autotuner,
             "stepwise": StepwiseAutotuner,
             "epsilon": EpsilonAutotuner,
             "confidence": ConfidenceAutotuner,
         }
-        autotuner: Callable = autotune_dispatch.get(autotuner)
+        if autotune is None:
+            autotune: str = os.getenv("TRITON_AUTOTUNE")
+        autotuner: Callable = autotune_dispatch.get(autotune, Autotuner)
         if autotuner:
             return autotuner(
                 fn,
