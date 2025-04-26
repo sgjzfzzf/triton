@@ -335,6 +335,7 @@ class StepwiseAutotuner(BaseAutotuner):
         rep=None,
         use_cuda_graph=False,
         do_bench=None,
+        ratio: float = 2.0,
         time_rep: float = 100.0,  # in ms
     ):
         super().__init__(
@@ -352,38 +353,71 @@ class StepwiseAutotuner(BaseAutotuner):
             use_cuda_graph,
             do_bench,
         )
-        self._time_rep: int = time_rep
+        self._ratio: float = ratio
+        self._time_rep: float = time_rep
         self._tcache: Dict[
-            Tuple[Any], Optional[Union[Config, Dict[Config, Tuple[float, int]]]]
-        ] = defaultdict(lambda: defaultdict(lambda: (0.0, 0)))
+            Tuple[Any], Optional[Union[Config, Dict[Config, Tuple[int, float, float]]]]
+        ] = defaultdict(lambda: defaultdict(lambda: (0, 0.0, 0.0)))
 
     def run(self, *args, **kwargs):
         self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
         key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
-        cache: Optional[Union[Config, Dict[Config, Tuple[float, int]]]] = self._tcache[
-            key
-        ]
+        cache: Optional[Union[Config, Dict[Config, Tuple[int, float, float]]]] = (
+            self._tcache[key]
+        )
         ret = None
         while ret == None:
             isconfig: bool = isinstance(cache, Config)
             if isconfig:
                 config: Config = cache
             else:
-                configs = [
+
+                def _filter_configs(args: Tuple[int, float, float]) -> bool:
+                    n, mean, _ = args
+                    return n * mean < self._time_rep
+
+                def _get_lower_boundary(n: int, mean: float, m2: float) -> float:
+                    if n <= 1:
+                        return -sys.float_info.max
+                    else:
+                        return mean - self._ratio * (m2 / (n - 1)) ** 0.5
+
+                def _get_upper_boundary(n: int, mean: float, m2: float) -> float:
+                    if n <= 1:
+                        return sys.float_info.max
+                    else:
+                        return mean + self._ratio * (m2 / (n - 1)) ** 0.5
+
+                config: Optional[Config] = None
+                configs: List[Config] = [
                     config
                     for config in self.prune_configs(kwargs)
                     if cache[config] is not None
-                    and (config not in cache or cache[config][0] < self._time_rep)
                 ]
-                if configs:
-                    config: Config = random.choice(configs)
+                candidates: List[Config] = [
+                    config for config in configs if _filter_configs(cache[config])
+                ]
+
+                if candidates:
+                    config = min(
+                        (c for c in candidates if cache[c] is not None),
+                        key=lambda c: _get_lower_boundary(*cache[c]),
+                    )
+                    config_upper_boundary: float = _get_upper_boundary(*cache[config])
+                    if all(
+                        _get_lower_boundary(*cache[c]) >= config_upper_boundary
+                        for c in configs
+                        if c != config and cache[c] is not None
+                    ):
+                        isconfig = True
                 else:
                     config = min(
                         (k for k, v in cache.items() if v is not None),
-                        key=lambda c: operator.truediv(*cache[c]),
+                        key=lambda c: cache[c][1],
                     )
-                    self._tcache[key] = config
                     isconfig = True
+                if isconfig:
+                    self._tcache[key] = config
                     if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
                         print(
                             f"Triton autotuning for function {self.base_fn.__name__} with `{key}` finished; best config selected: {config};"
@@ -415,14 +449,15 @@ class StepwiseAutotuner(BaseAutotuner):
                 end_event.record()
                 di.synchronize()
                 timecost: float = start_event.elapsed_time(end_event)
-                if ret:
-                    rep, count = cache[config]
-                    self._tcache[key][config] = (
-                        rep + timecost,
-                        count + 1,
-                    )
-                else:
+                if ret is None:
                     self._tcache[key][config] = None
+                else:
+                    n, mean, m2 = cache[config]
+                    n += 1
+                    delta = timecost - mean
+                    mean += delta / n
+                    m2 += delta * (timecost - mean)
+                    self._tcache[key][config] = (n, mean, m2)
         self.nargs = None
         return ret
 
@@ -525,130 +560,6 @@ class EpsilonAutotuner(BaseAutotuner):
                         epsilon = epsilon * (1 - self._decay)
                     self._tcache[key] = (candidate, epsilon, perf)
                 return ret
-
-
-class ConfidenceAutotuner(BaseAutotuner):
-    def __init__(
-        self,
-        fn,
-        arg_names,
-        configs,
-        key,
-        reset_to_zero,
-        restore_value,
-        pre_hook=None,
-        post_hook=None,
-        prune_configs_by=None,
-        warmup=None,
-        rep=None,
-        use_cuda_graph=False,
-        do_bench=None,
-        ratio: float = 2.0,
-    ):
-        super().__init__(
-            fn,
-            arg_names,
-            configs,
-            key,
-            reset_to_zero,
-            restore_value,
-            pre_hook,
-            post_hook,
-            prune_configs_by,
-            warmup,
-            rep,
-            use_cuda_graph,
-            do_bench,
-        )
-        self._ratio: float = ratio
-        self._tcache: Dict[
-            Tuple[Any], Optional[Union[Config, Dict[Config, Tuple[int, float, float]]]]
-        ] = defaultdict(lambda: defaultdict(lambda: (0, 0.0, 0.0)))
-
-    def run(self, *args, **kwargs):
-        self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
-        key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
-        cache: Optional[Union[Config, Dict[Config, Tuple[int, float, float]]]] = (
-            self._tcache[key]
-        )
-        ret = None
-        while ret == None:
-            isconfig: bool = isinstance(cache, Config)
-            if isconfig:
-                config: Config = cache
-            else:
-                configs = [
-                    config
-                    for config in self.prune_configs(kwargs)
-                    if cache[config] is not None
-                ]
-
-                def _get_lower_boundary(n: int, mean: float, m2: float) -> float:
-                    if n <= 2:
-                        return -sys.float_info.max
-                    else:
-                        return mean - self._ratio * ((m2 / (n - 1)) ** 0.5)
-
-                def _get_upper_boundary(n: int, mean: float, m2: float) -> float:
-                    if n <= 2:
-                        return sys.float_info.max
-                    else:
-                        return mean + self._ratio * ((m2 / (n - 1)) ** 0.5)
-
-                config: Config = min(
-                    (c for c in configs if cache[c] is not None),
-                    key=lambda c: _get_lower_boundary(*cache[c]),
-                )
-                config_upper_boundary: float = _get_upper_boundary(*cache[config])
-                if all(
-                    _get_lower_boundary(*cache[c]) >= config_upper_boundary
-                    for c in configs
-                    if c != config and cache[c] is not None
-                ):
-                    self._tcache[key] = config
-                    isconfig = True
-                    if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
-                        print(
-                            f"Triton autotuning for function {self.base_fn.__name__} with `{key}` finished; best config selected: {config};"
-                        )
-            if config.pre_hook is not None:
-                full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
-                config.pre_hook(full_nargs)
-            if not isconfig:
-                di = driver.active.get_device_interface()
-                start_event = di.Event(enable_timing=True)
-                end_event = di.Event(enable_timing=True)
-                start_event.record()
-            try:
-                ret = self.fn.run(
-                    *args,
-                    **kwargs,
-                    **config.all_kwargs(),
-                )
-            except OutOfResources:
-                if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
-                    args_display: List[Tuple[str, Any]] = [
-                        (k, self.nargs[k]) for k in self.keys
-                    ]
-                    print(
-                        f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` failed on config `{config}` with args `{args_display}`"
-                    )
-                ret = None
-            if not isconfig:
-                end_event.record()
-                di.synchronize()
-                timecost: float = start_event.elapsed_time(end_event)
-                if ret:
-                    n, mean, m2 = cache[config]
-                    n += 1
-                    delta = timecost - mean
-                    mean += delta / n
-                    m2 += delta * (timecost - mean)
-                    self._tcache[key][config] = (n, mean, m2)
-                else:
-                    self._tcache[key][config] = None
-        self.nargs = None
-        return ret
 
 
 class Config:
@@ -803,7 +714,6 @@ def autotune(
             "default": Autotuner,
             "stepwise": StepwiseAutotuner,
             "epsilon": EpsilonAutotuner,
-            "confidence": ConfidenceAutotuner,
         }
         if autotune is None:
             autotune: str = os.getenv("TRITON_AUTOTUNE")
