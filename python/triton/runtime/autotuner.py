@@ -304,8 +304,7 @@ class Autotuner(BaseAutotuner):
         self.best_config = config
         if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1" and not used_cached_result:
             print(
-                f"Triton autotuning for function {self.base_fn.__name__} finished after "
-                f"{self.bench_time:.2f}s; best config selected: {self.best_config};"
+                f"Triton autotuning for function {self.base_fn.__name__} with `{key}` finished after {self.bench_time:.2f}s; best config selected: {self.best_config};"
             )
         if config.pre_hook is not None:
             full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
@@ -335,7 +334,7 @@ class StepwiseAutotuner(BaseAutotuner):
         rep=None,
         use_cuda_graph=False,
         do_bench=None,
-        min_try: int = 20,
+        min_try: int = 100,
     ):
         super().__init__(
             fn,
@@ -382,6 +381,10 @@ class StepwiseAutotuner(BaseAutotuner):
                     )
                     self._tcache[key] = config
                     isconfig = True
+                    if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
+                        print(
+                            f"Triton autotuning for function {self.base_fn.__name__} with `{key}` finished; best config selected: {config};"
+                        )
             if config.pre_hook is not None:
                 full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
                 config.pre_hook(full_nargs)
@@ -402,13 +405,13 @@ class StepwiseAutotuner(BaseAutotuner):
                         (k, self.nargs[k]) for k in self.keys
                     ]
                     print(
-                        f"Triton autotuning for function `{self.base_fn.__name__}` failed on config `{config}` with args `{args_display}`"
+                        f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` failed on config `{config}` with args `{args_display}`"
                     )
                 ret = None
             if not isconfig:
                 end_event.record()
                 di.synchronize()
-                timecost: float = end_event.elapsed_time(start_event)
+                timecost: float = start_event.elapsed_time(end_event)
                 if ret:
                     self._tcache[key][config].append(timecost)
                 else:
@@ -462,10 +465,7 @@ class EpsilonAutotuner(BaseAutotuner):
         while ret == None:
             if key in self._tcache:
                 candidate, epsilon, perf = self._tcache[key]
-                if random.random() < epsilon:
-                    is_explore: bool = True
-                else:
-                    is_explore: bool = False
+                is_explore: bool = random.random() < epsilon
             else:
                 is_explore: bool = True
                 candidate: Optional[Config] = None
@@ -502,14 +502,14 @@ class EpsilonAutotuner(BaseAutotuner):
                         (k, self.nargs[k]) for k in self.keys
                     ]
                     print(
-                        f"Triton autotuning for function `{self.base_fn.__name__}` failed on config `{config}` with args `{args_display}`"
+                        f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` failed on config `{config}` with args `{args_display}`"
                     )
                 ret = None
             if ret is not None:
                 if is_explore:
                     end_event.record()
                     di.synchronize()
-                    timecost: float = end_event.elapsed_time(start_event)
+                    timecost: float = start_event.elapsed_time(end_event)
                     if perf > timecost:
                         candidate = config
                         epsilon = self._epsilon
@@ -577,36 +577,40 @@ class ConfidenceAutotuner(BaseAutotuner):
                 def _get_boundary(
                     timelist: List[int], op: Callable[[float, float], float]
                 ) -> float:
-                    if timelist:
-                        mean: float = statistics.mean(timelist)
-                    else:
-                        mean: float = sys.float_info.max
-                    if len(timelist) > 1:
-                        variance: float = statistics.variance(timelist)
-                    elif len(timelist) == 1:
-                        variance: float = sys.float_info.max
-                    else:
-                        variance: float = 0.0
-                    return op(mean, self._ratio * variance)
+                    mean: float = statistics.mean(timelist)
+                    margin: float = (
+                        self._ratio * statistics.stdev(timelist) / len(timelist) ** 0.5
+                    )
+                    return op(mean, margin)
 
                 def _get_upper_boundary(timelist: List[int]) -> float:
-                    return _get_boundary(timelist, lambda x, y: x + y)
+                    if len(timelist) <= 2:
+                        return sys.float_info.max
+                    else:
+                        return _get_boundary(timelist, lambda x, y: x + y)
 
                 def _get_lower_boundary(timelist: List[int]) -> float:
-                    return _get_boundary(timelist, lambda x, y: x - y)
+                    if len(timelist) <= 2:
+                        return -sys.float_info.max
+                    else:
+                        return _get_boundary(timelist, lambda x, y: x - y)
 
-                config: Config = builtins.min(
-                    configs,
+                config: Config = min(
+                    (c for c in configs if cache[c] is not None),
                     key=lambda c: _get_lower_boundary(cache[c]),
                 )
                 config_upper_boundary: float = _get_upper_boundary(cache[config])
                 if all(
-                    _get_lower_boundary(v) >= config_upper_boundary
-                    for k, v in cache.items()
-                    if k != config
+                    _get_lower_boundary(cache[c]) >= config_upper_boundary
+                    for c in configs
+                    if c != config and cache[c] is not None
                 ):
                     self._tcache[key] = config
                     isconfig = True
+                    if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
+                        print(
+                            f"Triton autotuning for function {self.base_fn.__name__} with `{key}` finished; best config selected: {config};"
+                        )
             if config.pre_hook is not None:
                 full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
                 config.pre_hook(full_nargs)
@@ -627,13 +631,13 @@ class ConfidenceAutotuner(BaseAutotuner):
                         (k, self.nargs[k]) for k in self.keys
                     ]
                     print(
-                        f"Triton autotuning for function `{self.base_fn.__name__}` failed on config `{config}` with args `{args_display}`"
+                        f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` failed on config `{config}` with args `{args_display}`"
                     )
                 ret = None
             if not isconfig:
                 end_event.record()
                 di.synchronize()
-                timecost: float = end_event.elapsed_time(start_event)
+                timecost: float = start_event.elapsed_time(end_event)
                 if ret:
                     self._tcache[key][config].append(timecost)
                 else:
