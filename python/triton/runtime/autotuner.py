@@ -2,6 +2,7 @@ from __future__ import annotations
 from abc import abstractmethod
 
 import builtins
+import operator
 import os
 import time
 import inspect
@@ -334,7 +335,7 @@ class StepwiseAutotuner(BaseAutotuner):
         rep=None,
         use_cuda_graph=False,
         do_bench=None,
-        min_try: int = 100,
+        time_rep: float = 100.0,  # in ms
     ):
         super().__init__(
             fn,
@@ -351,15 +352,17 @@ class StepwiseAutotuner(BaseAutotuner):
             use_cuda_graph,
             do_bench,
         )
-        self._min_try: int = min_try
+        self._time_rep: int = time_rep
         self._tcache: Dict[
-            Tuple[Any], Optional[Union[Config, Dict[Config, List[int]]]]
-        ] = defaultdict(lambda: defaultdict(list))
+            Tuple[Any], Optional[Union[Config, Dict[Config, Tuple[float, int]]]]
+        ] = defaultdict(lambda: defaultdict(lambda: (0.0, 0)))
 
     def run(self, *args, **kwargs):
         self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
         key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
-        cache: Optional[Union[Config, Dict[Config, List[int]]]] = self._tcache[key]
+        cache: Optional[Union[Config, Dict[Config, Tuple[float, int]]]] = self._tcache[
+            key
+        ]
         ret = None
         while ret == None:
             isconfig: bool = isinstance(cache, Config)
@@ -370,14 +373,14 @@ class StepwiseAutotuner(BaseAutotuner):
                     config
                     for config in self.prune_configs(kwargs)
                     if cache[config] is not None
-                    and (config not in cache or len(cache[config]) < self._min_try)
+                    and (config not in cache or cache[config][0] < self._time_rep)
                 ]
                 if configs:
                     config: Config = random.choice(configs)
                 else:
                     config = min(
                         (k for k, v in cache.items() if v is not None),
-                        key=lambda c: sum(cache[c]) / len(cache[c]),
+                        key=lambda c: operator.truediv(*cache[c]),
                     )
                     self._tcache[key] = config
                     isconfig = True
@@ -413,7 +416,11 @@ class StepwiseAutotuner(BaseAutotuner):
                 di.synchronize()
                 timecost: float = start_event.elapsed_time(end_event)
                 if ret:
-                    self._tcache[key][config].append(timecost)
+                    rep, count = cache[config]
+                    self._tcache[key][config] = (
+                        rep + timecost,
+                        count + 1,
+                    )
                 else:
                     self._tcache[key][config] = None
         self.nargs = None
@@ -587,13 +594,13 @@ class ConfidenceAutotuner(BaseAutotuner):
                     if len(timelist) <= 2:
                         return sys.float_info.max
                     else:
-                        return _get_boundary(timelist, lambda x, y: x + y)
+                        return _get_boundary(timelist, operator.add)
 
                 def _get_lower_boundary(timelist: List[int]) -> float:
                     if len(timelist) <= 2:
                         return -sys.float_info.max
                     else:
-                        return _get_boundary(timelist, lambda x, y: x - y)
+                        return _get_boundary(timelist, operator.sub)
 
                 config: Config = min(
                     (c for c in configs if cache[c] is not None),
