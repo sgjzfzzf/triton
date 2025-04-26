@@ -543,7 +543,7 @@ class ConfidenceAutotuner(BaseAutotuner):
         rep=None,
         use_cuda_graph=False,
         do_bench=None,
-        ratio: float = 3.0,
+        ratio: float = 2.0,
     ):
         super().__init__(
             fn,
@@ -562,13 +562,15 @@ class ConfidenceAutotuner(BaseAutotuner):
         )
         self._ratio: float = ratio
         self._tcache: Dict[
-            Tuple[Any], Optional[Union[Config, Dict[Config, List[int]]]]
-        ] = defaultdict(lambda: defaultdict(list))
+            Tuple[Any], Optional[Union[Config, Dict[Config, Tuple[int, float, float]]]]
+        ] = defaultdict(lambda: defaultdict(lambda: (0, 0.0, 0.0)))
 
     def run(self, *args, **kwargs):
         self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
         key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
-        cache: Optional[Union[Config, Dict[Config, List[int]]]] = self._tcache[key]
+        cache: Optional[Union[Config, Dict[Config, Tuple[int, float, float]]]] = (
+            self._tcache[key]
+        )
         ret = None
         while ret == None:
             isconfig: bool = isinstance(cache, Config)
@@ -581,34 +583,25 @@ class ConfidenceAutotuner(BaseAutotuner):
                     if cache[config] is not None
                 ]
 
-                def _get_boundary(
-                    timelist: List[int], op: Callable[[float, float], float]
-                ) -> float:
-                    mean: float = statistics.mean(timelist)
-                    margin: float = (
-                        self._ratio * statistics.stdev(timelist) / len(timelist) ** 0.5
-                    )
-                    return op(mean, margin)
-
-                def _get_upper_boundary(timelist: List[int]) -> float:
-                    if len(timelist) <= 2:
-                        return sys.float_info.max
-                    else:
-                        return _get_boundary(timelist, operator.add)
-
-                def _get_lower_boundary(timelist: List[int]) -> float:
-                    if len(timelist) <= 2:
+                def _get_lower_boundary(n: int, mean: float, m2: float) -> float:
+                    if n <= 2:
                         return -sys.float_info.max
                     else:
-                        return _get_boundary(timelist, operator.sub)
+                        return mean - self._ratio * ((m2 / (n - 1)) ** 0.5)
+
+                def _get_upper_boundary(n: int, mean: float, m2: float) -> float:
+                    if n <= 2:
+                        return sys.float_info.max
+                    else:
+                        return mean + self._ratio * ((m2 / (n - 1)) ** 0.5)
 
                 config: Config = min(
                     (c for c in configs if cache[c] is not None),
-                    key=lambda c: _get_lower_boundary(cache[c]),
+                    key=lambda c: _get_lower_boundary(*cache[c]),
                 )
-                config_upper_boundary: float = _get_upper_boundary(cache[config])
+                config_upper_boundary: float = _get_upper_boundary(*cache[config])
                 if all(
-                    _get_lower_boundary(cache[c]) >= config_upper_boundary
+                    _get_lower_boundary(*cache[c]) >= config_upper_boundary
                     for c in configs
                     if c != config and cache[c] is not None
                 ):
@@ -646,7 +639,12 @@ class ConfidenceAutotuner(BaseAutotuner):
                 di.synchronize()
                 timecost: float = start_event.elapsed_time(end_event)
                 if ret:
-                    self._tcache[key][config].append(timecost)
+                    n, mean, m2 = cache[config]
+                    n += 1
+                    delta = timecost - mean
+                    mean += delta / n
+                    m2 += delta * (timecost - mean)
+                    self._tcache[key][config] = (n, mean, m2)
                 else:
                     self._tcache[key][config] = None
         self.nargs = None
