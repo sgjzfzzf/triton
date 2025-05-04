@@ -335,7 +335,7 @@ class StepwiseAutotuner(BaseAutotuner):
         rep=None,
         use_cuda_graph=False,
         do_bench=None,
-        ratio: float = 2.0,
+        ratio: float = 1.0,
         time_rep: float = 100.0,  # in ms
     ):
         super().__init__(
@@ -479,7 +479,7 @@ class EpsilonAutotuner(BaseAutotuner):
         use_cuda_graph=False,
         do_bench=None,
         epsilon: float = 1.0,
-        decay: float = 0.001,
+        decay: float = 0.5,
     ):
         super().__init__(
             fn,
