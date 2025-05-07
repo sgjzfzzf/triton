@@ -2,15 +2,13 @@ from __future__ import annotations
 from abc import abstractmethod
 
 import builtins
-import operator
 import os
 import time
 import inspect
 import random
-import statistics
 import sys
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from .jit import KernelInterface
 from .errors import OutOfResources
@@ -280,6 +278,9 @@ class Autotuner(BaseAutotuner):
         )
 
     def run(self, *args, **kwargs):
+        enable_runtime_measurement: bool = (
+            os.getenv("TRITON_ENABLE_RUNTIME_MEASUREMENT", None) == "1"
+        )
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
         if len(self.configs) > 1:
@@ -310,11 +311,24 @@ class Autotuner(BaseAutotuner):
         if config.pre_hook is not None:
             full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
             config.pre_hook(full_nargs)
+        if enable_runtime_measurement:
+            di = driver.active.get_device_interface()
+            start_event = di.Event(enable_timing=True)
+            end_event = di.Event(enable_timing=True)
+            start_event.record()
         ret = self.fn.run(
             *args,
             **kwargs,
             **config.all_kwargs(),
         )
+        if enable_runtime_measurement:
+            end_event.record()
+            di.synchronize()
+            timecost: float = start_event.elapsed_time(end_event)
+            if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
+                print(
+                    f"Triton autotuning for function {self.base_fn.__name__} with `{key}` on config `{config}` took {timecost}ms"
+                )
         self.nargs = None
         return ret
 
@@ -458,6 +472,10 @@ class StepwiseAutotuner(BaseAutotuner):
                     mean += delta / n
                     m2 += delta * (timecost - mean)
                     self._tcache[key][config] = (n, mean, m2)
+                    if os.getenv("TRITON_ENABLE_RUNTIME_MEASUREMENT", None) == "1":
+                        print(
+                            f"Triton autotuning for function {self.base_fn.__name__} with `{key}` on config `{config}` took {timecost}ms;"
+                        )
         self.nargs = None
         return ret
 
@@ -559,6 +577,10 @@ class EpsilonAutotuner(BaseAutotuner):
                     else:
                         epsilon = epsilon * (1 - self._decay)
                     self._tcache[key] = (candidate, epsilon, perf)
+                    if os.getenv("TRITON_ENABLE_RUNTIME_MEASUREMENT", None) == "1":
+                        print(
+                            f"Triton autotuning for function {self.base_fn.__name__} with `{key}` on config `{config}` took {timecost}ms;"
+                        )
                 return ret
 
 
@@ -717,7 +739,7 @@ def autotune(
         }
         if autotune is None:
             autotune: str = os.getenv("TRITON_AUTOTUNE")
-        autotuner: Callable = autotune_dispatch.get(autotune, Autotuner)
+        autotuner: Callable = autotune_dispatch.get(autotune)
         if autotuner:
             return autotuner(
                 fn,
