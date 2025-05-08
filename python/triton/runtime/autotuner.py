@@ -7,6 +7,7 @@ import time
 import inspect
 import random
 import sys
+import math
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
@@ -306,7 +307,7 @@ class Autotuner(BaseAutotuner):
         self.best_config = config
         if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1" and not used_cached_result:
             print(
-                f"Triton autotuning for function {self.base_fn.__name__} with `{key}` finished after {self.bench_time:.2f}s; best config selected: {self.best_config};"
+                f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` finished after {self.bench_time:.2f}s; best config selected: {self.best_config};"
             )
         if config.pre_hook is not None:
             full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
@@ -327,7 +328,7 @@ class Autotuner(BaseAutotuner):
             timecost: float = start_event.elapsed_time(end_event)
             if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
                 print(
-                    f"Triton autotuning for function {self.base_fn.__name__} with `{key}` on config `{config}` took {timecost}ms"
+                    f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` on config `{config}` took {timecost}ms"
                 )
         self.nargs = None
         return ret
@@ -350,6 +351,8 @@ class StepwiseAutotuner(BaseAutotuner):
         use_cuda_graph=False,
         do_bench=None,
         ratio: float = 1.0,
+        K: int = 1,
+        delta: float = 0.05,
         time_rep: float = 100.0,  # in ms
     ):
         super().__init__(
@@ -368,17 +371,19 @@ class StepwiseAutotuner(BaseAutotuner):
             do_bench,
         )
         self._ratio: float = ratio
+        self._K: int = K
+        self._delta: float = delta
         self._time_rep: float = time_rep
         self._tcache: Dict[
-            Tuple[Any], Optional[Union[Config, Dict[Config, Tuple[int, float, float]]]]
-        ] = defaultdict(lambda: defaultdict(lambda: (0, 0.0, 0.0)))
+            Tuple[Any], Optional[Union[Config, Dict[Config, Tuple[int, float]]]]
+        ] = defaultdict(lambda: defaultdict(lambda: (0, 0.0)))
 
     def run(self, *args, **kwargs):
         self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
         key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
-        cache: Optional[Union[Config, Dict[Config, Tuple[int, float, float]]]] = (
-            self._tcache[key]
-        )
+        cache: Optional[Union[Config, Dict[Config, Tuple[int, float]]]] = self._tcache[
+            key
+        ]
         ret = None
         while ret == None:
             isconfig: bool = isinstance(cache, Config)
@@ -387,27 +392,41 @@ class StepwiseAutotuner(BaseAutotuner):
             else:
 
                 def _filter_configs(args: Tuple[int, float, float]) -> bool:
-                    n, mean, _ = args
-                    return n * mean < self._time_rep
+                    _, reward = args
+                    return reward < self._time_rep
 
-                def _get_lower_boundary(n: int, mean: float, m2: float) -> float:
-                    if n <= 1:
-                        return -sys.float_info.max
-                    else:
-                        return mean - self._ratio * (m2 / (n - 1)) ** 0.5
-
-                def _get_upper_boundary(n: int, mean: float, m2: float) -> float:
-                    if n <= 1:
-                        return sys.float_info.max
-                    else:
-                        return mean + self._ratio * (m2 / (n - 1)) ** 0.5
-
-                config: Optional[Config] = None
                 configs: List[Config] = [
                     config
                     for config in self.prune_configs(kwargs)
                     if cache[config] is not None
                 ]
+
+                t: int = sum(cache[config][0] for config in configs)
+
+                def _get_mean(n: int, reward: float) -> float:
+                    return reward / n if n > 0 else 0.0
+
+                def _get_select_bonus(n: int) -> float:
+                    return (
+                        math.sqrt(2 * math.log(t) / n) if n > 0 else sys.float_info.max
+                    )
+
+                def _get_stop_bonus(n: int) -> float:
+                    return (
+                        math.sqrt(math.log(2 * self._K * t**2 / self._delta))
+                        if n > 0
+                        else sys.float_info.max
+                    )
+
+                def _get_select_lower_boundary(n: int, reward: float) -> float:
+                    return _get_mean(n, reward) - _get_select_bonus(n)
+
+                def _get_stop_lower_boundary(n: int, reward: float) -> float:
+                    return _get_mean(n, reward) - _get_stop_bonus(n)
+
+                def _get_stop_upper_boundary(n: int, reward: float) -> float:
+                    return _get_mean(n, reward) + _get_stop_bonus(n)
+
                 candidates: List[Config] = [
                     config for config in configs if _filter_configs(cache[config])
                 ]
@@ -415,18 +434,19 @@ class StepwiseAutotuner(BaseAutotuner):
                 if candidates:
                     config = min(
                         (c for c in candidates if cache[c] is not None),
-                        key=lambda c: _get_lower_boundary(*cache[c]),
+                        key=lambda c: _get_select_lower_boundary(*cache[c]),
                     )
-                    config_upper_boundary: float = _get_upper_boundary(*cache[config])
-                    if all(
-                        _get_lower_boundary(*cache[c]) >= config_upper_boundary
+                    config_upper_boundary: float = _get_stop_upper_boundary(
+                        *cache[config]
+                    )
+                    isconfig = all(
+                        _get_stop_lower_boundary(*cache[c]) >= config_upper_boundary
                         for c in configs
                         if c != config and cache[c] is not None
-                    ):
-                        isconfig = True
+                    )
                 else:
                     config = min(
-                        (k for k, v in cache.items() if v is not None),
+                        (config for config in configs if cache[config] is not None),
                         key=lambda c: cache[c][1],
                     )
                     isconfig = True
@@ -434,7 +454,7 @@ class StepwiseAutotuner(BaseAutotuner):
                     self._tcache[key] = config
                     if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
                         print(
-                            f"Triton autotuning for function {self.base_fn.__name__} with `{key}` finished; best config selected: {config};"
+                            f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` finished; best config selected: {config};"
                         )
             if config.pre_hook is not None:
                 full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
@@ -466,15 +486,13 @@ class StepwiseAutotuner(BaseAutotuner):
                 if ret is None:
                     self._tcache[key][config] = None
                 else:
-                    n, mean, m2 = cache[config]
+                    n, reward = cache[config]
                     n += 1
-                    delta = timecost - mean
-                    mean += delta / n
-                    m2 += delta * (timecost - mean)
-                    self._tcache[key][config] = (n, mean, m2)
+                    reward += timecost
+                    self._tcache[key][config] = (n, reward)
                     if os.getenv("TRITON_ENABLE_RUNTIME_MEASUREMENT", None) == "1":
                         print(
-                            f"Triton autotuning for function {self.base_fn.__name__} with `{key}` on config `{config}` took {timecost}ms;"
+                            f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` on config `{config}` took {timecost}ms;"
                         )
         self.nargs = None
         return ret
@@ -579,7 +597,7 @@ class EpsilonAutotuner(BaseAutotuner):
                     self._tcache[key] = (candidate, epsilon, perf)
                     if os.getenv("TRITON_ENABLE_RUNTIME_MEASUREMENT", None) == "1":
                         print(
-                            f"Triton autotuning for function {self.base_fn.__name__} with `{key}` on config `{config}` took {timecost}ms;"
+                            f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` on config `{config}` took {timecost}ms;"
                         )
                 return ret
 
