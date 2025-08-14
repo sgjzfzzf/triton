@@ -6,10 +6,11 @@ import os
 import time
 import inspect
 import random
+import scipy.stats
 import sys
 import math
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .jit import KernelInterface
 from .errors import OutOfResources
@@ -602,6 +603,67 @@ class EpsilonAutotuner(BaseAutotuner):
                 return ret
 
 
+class ThompsonAutotuner(BaseAutotuner):
+    def __init__(
+        self,
+        fn,
+        arg_names,
+        configs,
+        key,
+        reset_to_zero,
+        restore_value,
+        pre_hook=None,
+        post_hook=None,
+        prune_configs_by=None,
+        warmup=None,
+        rep=None,
+        use_cuda_graph=False,
+        do_bench=None,
+    ):
+        super().__init__(
+            fn,
+            arg_names,
+            configs,
+            key,
+            reset_to_zero,
+            restore_value,
+            pre_hook,
+            post_hook,
+            prune_configs_by,
+            warmup,
+            rep,
+            use_cuda_graph,
+            do_bench,
+        )
+        self._tcache: Dict[
+            Tuple[Any],
+            Dict[Config, Optional[Union[Config, Tuple[float, float, float, float]]]],
+        ] = defaultdict(lambda: defaultdict(lambda: (0.0, 1.0, 1.0, 1.0)))
+
+    def run(self, *args, **kwargs):
+        self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
+        key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
+        cache: Optional[Union[Config, Dict[Config, Tuple[int, float]]]] = self._tcache[
+            key
+        ]
+        ret = None
+        while ret == None:
+            isconfig: bool = isinstance(cache, Config)
+            if isconfig:
+                config: Config = cache
+            else:
+                configs: List[Config] = [
+                    config
+                    for config in self.prune_configs(kwargs)
+                    if cache[config] is not None
+                ]
+                for config in configs:
+                    mu_post, ka_post, alpha_post, beta_post = cache[config]
+                    sigma2: float = scipy.stats.invgamma.rvs(alpha_post, beta_post)
+                    mu: float = scipy.stats.norm.rvs(mu_post, sigma2 / ka_post**0.5)
+                break
+
+
 class Config:
     """
     An object that represents a possible kernel configuration for the auto-tuner to try.
@@ -754,6 +816,7 @@ def autotune(
             "default": Autotuner,
             "stepwise": StepwiseAutotuner,
             "epsilon": EpsilonAutotuner,
+            "thompson": ThompsonAutotuner,
         }
         if autotune is None:
             autotune: str = os.getenv("TRITON_AUTOTUNE")
