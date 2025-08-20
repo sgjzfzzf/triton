@@ -6,10 +6,11 @@ import os
 import time
 import inspect
 import random
+import scipy.stats
 import sys
 import math
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .jit import KernelInterface
 from .errors import OutOfResources
@@ -602,6 +603,126 @@ class EpsilonAutotuner(BaseAutotuner):
                 return ret
 
 
+class ThompsonAutotuner(BaseAutotuner):
+    def __init__(
+        self,
+        fn,
+        arg_names,
+        configs,
+        key,
+        reset_to_zero,
+        restore_value,
+        pre_hook=None,
+        post_hook=None,
+        prune_configs_by=None,
+        warmup=None,
+        rep=None,
+        use_cuda_graph=False,
+        do_bench=None,
+    ):
+        super().__init__(
+            fn,
+            arg_names,
+            configs,
+            key,
+            reset_to_zero,
+            restore_value,
+            pre_hook,
+            post_hook,
+            prune_configs_by,
+            warmup,
+            rep,
+            use_cuda_graph,
+            do_bench,
+        )
+        self._tcache: Dict[
+            Tuple[Any],
+            Dict[Config, Optional[Union[Config, Tuple[float, int, float, float]]]],
+        ] = defaultdict(lambda: defaultdict(lambda: (0.0, 1, 1.0, 1.0)))
+
+    def run(self, *args, **kwargs):
+        self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
+        key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
+        cache: Optional[
+            Union[Config, Dict[Config, Tuple[float, int, float, float]]]
+        ] = self._tcache[key]
+        ret = None
+        while ret == None:
+            isconfig: bool = isinstance(cache, Config)
+            if isconfig:
+                config: Config = cache
+            else:
+                configs: List[Config] = [
+                    config
+                    for config in self.prune_configs(kwargs)
+                    if cache[config] is not None
+                ]
+
+                def _sample(
+                    mu_post: float,
+                    ka_post: int,
+                    alpha_post: float,
+                    beta_post: float,
+                ) -> float:
+                    sigma: float = scipy.stats.invgamma.rvs(alpha_post, beta_post)
+                    mu: float = scipy.stats.norm.rvs(mu_post, sigma / ka_post**0.5)
+                    return mu
+
+                config: Config = min(
+                    filter(lambda c: cache[c] is not None, configs),
+                    key=lambda c: _sample(*cache[c]),
+                )
+            if config.pre_hook is not None:
+                full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
+                config.pre_hook(full_nargs)
+            if not isconfig:
+                di = driver.active.get_device_interface()
+                start_event = di.Event(enable_timing=True)
+                end_event = di.Event(enable_timing=True)
+                start_event.record()
+            try:
+                ret = self.fn.run(
+                    *args,
+                    **kwargs,
+                    **config.all_kwargs(),
+                )
+            except OutOfResources:
+                if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
+                    args_display: List[Tuple[str, Any]] = [
+                        (k, self.nargs[k]) for k in self.keys
+                    ]
+                    print(
+                        f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` failed on config `{config}` with args `{args_display}`"
+                    )
+                ret = None
+            if not isconfig:
+                end_event.record()
+                di.synchronize()
+                timecost: float = start_event.elapsed_time(end_event)
+                if ret is None:
+                    self._tcache[key][config] = None
+                else:
+                    mu_prior, ka_prior, alpha_prior, beta_prior = cache[config]
+                    ka_post = ka_prior + 1
+                    mu_post = (mu_prior * (ka_prior - 1) + timecost) / ka_prior
+                    alpha_post = alpha_prior + 0.5
+                    beta_post = beta_prior + 0.5 * (timecost - mu_prior) * (
+                        timecost - mu_post
+                    )
+                    self._tcache[key][config] = (
+                        mu_post,
+                        ka_post,
+                        alpha_post,
+                        beta_post,
+                    )
+                    if os.getenv("TRITON_ENABLE_RUNTIME_MEASUREMENT", None) == "1":
+                        print(
+                            f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` on config `{config}` took {timecost}ms;"
+                        )
+        self.nargs = None
+        return ret
+
+
 class Config:
     """
     An object that represents a possible kernel configuration for the auto-tuner to try.
@@ -754,6 +875,7 @@ def autotune(
             "default": Autotuner,
             "stepwise": StepwiseAutotuner,
             "epsilon": EpsilonAutotuner,
+            "thompson": ThompsonAutotuner,
         }
         if autotune is None:
             autotune: str = os.getenv("TRITON_AUTOTUNE")
