@@ -659,14 +659,13 @@ class ThompsonAutotuner(BaseAutotuner):
                 ]
 
                 def _sample(
-                    mu_post: float,
-                    ka_post: int,
-                    alpha_post: float,
-                    beta_post: float,
+                    mu: float,
+                    ka: int,
+                    alpha: float,
+                    beta: float,
                 ) -> float:
-                    sigma: float = scipy.stats.invgamma.rvs(alpha_post, beta_post)
-                    mu: float = scipy.stats.norm.rvs(mu_post, sigma / ka_post**0.5)
-                    return mu
+                    sigma: float = scipy.stats.invgamma.rvs(alpha, beta)
+                    return scipy.stats.norm.rvs(mu, sigma / ka**0.5)
 
                 config: Config = min(
                     filter(lambda c: cache[c] is not None, configs),
