@@ -338,7 +338,111 @@ class Autotuner(BaseAutotuner):
         return ret
 
 
-class StepwiseAutotuner(BaseAutotuner):
+class EpsilonAutotuner(BaseAutotuner):
+    def __init__(
+        self,
+        fn,
+        arg_names,
+        configs,
+        key,
+        reset_to_zero,
+        restore_value,
+        pre_hook=None,
+        post_hook=None,
+        prune_configs_by=None,
+        warmup=None,
+        rep=None,
+        use_cuda_graph=False,
+        do_bench=None,
+        epsilon: float = 1.0,
+        decay: float = 0.5,
+    ):
+        super().__init__(
+            fn,
+            arg_names,
+            configs,
+            key,
+            reset_to_zero,
+            restore_value,
+            pre_hook,
+            post_hook,
+            prune_configs_by,
+            warmup,
+            rep,
+            use_cuda_graph,
+            do_bench,
+        )
+        self._epsilon: float = epsilon
+        self._decay: float = decay
+        self._tcache: Dict[Tuple[Any], Tuple[Config, float, float]] = {}
+
+    def run(self, *args, **kwargs):
+        self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
+        key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
+        ret = None
+        while ret == None:
+            if key in self._tcache:
+                candidate, epsilon, perf = self._tcache[key]
+                is_explore: bool = random.random() < epsilon
+            else:
+                is_explore: bool = True
+                candidate: Optional[Config] = None
+                epsilon: float = self._epsilon
+                perf: float = sys.float_info.max
+            config: Optional[Config] = None
+            if is_explore:
+                configs = [
+                    config
+                    for config in self.prune_configs(kwargs)
+                    if config is not candidate
+                ]
+                if configs:
+                    config: Config = random.choice(configs)
+            if config is None:
+                config: Config = candidate
+            if config.pre_hook is not None:
+                full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
+                config.pre_hook(full_nargs)
+            if is_explore:
+                di = driver.active.get_device_interface()
+                start_event = di.Event(enable_timing=True)
+                end_event = di.Event(enable_timing=True)
+                start_event.record()
+            try:
+                ret = self.fn.run(
+                    *args,
+                    **kwargs,
+                    **config.all_kwargs(),
+                )
+            except OutOfResources:
+                if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
+                    args_display: List[Tuple[str, Any]] = [
+                        (k, self.nargs[k]) for k in self.keys
+                    ]
+                    print(
+                        f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` failed on config `{config}` with args `{args_display}`"
+                    )
+                ret = None
+            if ret is not None:
+                if is_explore:
+                    end_event.record()
+                    di.synchronize()
+                    timecost: float = start_event.elapsed_time(end_event)
+                    if perf > timecost:
+                        candidate = config
+                        epsilon = self._epsilon
+                        perf = timecost
+                    else:
+                        epsilon = epsilon * (1 - self._decay)
+                    self._tcache[key] = (candidate, epsilon, perf)
+                    if os.getenv("TRITON_ENABLE_RUNTIME_MEASUREMENT", None) == "1":
+                        print(
+                            f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` on config `{config}` took {timecost}ms;"
+                        )
+                return ret
+
+
+class UCBAutotuner(BaseAutotuner):
     def __init__(
         self,
         fn,
@@ -356,7 +460,7 @@ class StepwiseAutotuner(BaseAutotuner):
         do_bench=None,
         ratio: float = 1.0,
         delta: float = 0.05,
-    ) -> StepwiseAutotuner:
+    ) -> UCBAutotuner:
         super().__init__(
             fn,
             arg_names,
@@ -512,110 +616,6 @@ class StepwiseAutotuner(BaseAutotuner):
                         )
         self.nargs = None
         return ret
-
-
-class EpsilonAutotuner(BaseAutotuner):
-    def __init__(
-        self,
-        fn,
-        arg_names,
-        configs,
-        key,
-        reset_to_zero,
-        restore_value,
-        pre_hook=None,
-        post_hook=None,
-        prune_configs_by=None,
-        warmup=None,
-        rep=None,
-        use_cuda_graph=False,
-        do_bench=None,
-        epsilon: float = 1.0,
-        decay: float = 0.5,
-    ):
-        super().__init__(
-            fn,
-            arg_names,
-            configs,
-            key,
-            reset_to_zero,
-            restore_value,
-            pre_hook,
-            post_hook,
-            prune_configs_by,
-            warmup,
-            rep,
-            use_cuda_graph,
-            do_bench,
-        )
-        self._epsilon: float = epsilon
-        self._decay: float = decay
-        self._tcache: Dict[Tuple[Any], Tuple[Config, float, float]] = {}
-
-    def run(self, *args, **kwargs):
-        self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
-        key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
-        ret = None
-        while ret == None:
-            if key in self._tcache:
-                candidate, epsilon, perf = self._tcache[key]
-                is_explore: bool = random.random() < epsilon
-            else:
-                is_explore: bool = True
-                candidate: Optional[Config] = None
-                epsilon: float = self._epsilon
-                perf: float = sys.float_info.max
-            config: Optional[Config] = None
-            if is_explore:
-                configs = [
-                    config
-                    for config in self.prune_configs(kwargs)
-                    if config is not candidate
-                ]
-                if configs:
-                    config: Config = random.choice(configs)
-            if config is None:
-                config: Config = candidate
-            if config.pre_hook is not None:
-                full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
-                config.pre_hook(full_nargs)
-            if is_explore:
-                di = driver.active.get_device_interface()
-                start_event = di.Event(enable_timing=True)
-                end_event = di.Event(enable_timing=True)
-                start_event.record()
-            try:
-                ret = self.fn.run(
-                    *args,
-                    **kwargs,
-                    **config.all_kwargs(),
-                )
-            except OutOfResources:
-                if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
-                    args_display: List[Tuple[str, Any]] = [
-                        (k, self.nargs[k]) for k in self.keys
-                    ]
-                    print(
-                        f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` failed on config `{config}` with args `{args_display}`"
-                    )
-                ret = None
-            if ret is not None:
-                if is_explore:
-                    end_event.record()
-                    di.synchronize()
-                    timecost: float = start_event.elapsed_time(end_event)
-                    if perf > timecost:
-                        candidate = config
-                        epsilon = self._epsilon
-                        perf = timecost
-                    else:
-                        epsilon = epsilon * (1 - self._decay)
-                    self._tcache[key] = (candidate, epsilon, perf)
-                    if os.getenv("TRITON_ENABLE_RUNTIME_MEASUREMENT", None) == "1":
-                        print(
-                            f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` on config `{config}` took {timecost}ms;"
-                        )
-                return ret
 
 
 class ThompsonAutotuner(BaseAutotuner):
@@ -887,8 +887,8 @@ def autotune(
     def decorator(fn, autotune: Optional[str] = None):
         autotune_dispatch: Dict[str, Callable] = {
             "default": Autotuner,
-            "stepwise": StepwiseAutotuner,
             "epsilon": EpsilonAutotuner,
+            "ucb": UCBAutotuner,
             "thompson": ThompsonAutotuner,
         }
         if autotune is None:
