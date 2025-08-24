@@ -10,6 +10,7 @@ import scipy.stats
 import sys
 import math
 from collections import defaultdict
+from itertools import starmap
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .jit import KernelInterface
@@ -34,7 +35,8 @@ class BaseAutotuner(KernelInterface):
         rep=None,
         use_cuda_graph=False,
         do_bench=None,
-    ):
+        preruns: int = 5,
+    ) -> BaseAutotuner:
         """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
             'perf_model': performance model used to predicate running time with different configs, returns running time
@@ -118,6 +120,7 @@ class BaseAutotuner(KernelInterface):
         self.num_warmups = warmup
         self.num_reps = rep
         self.use_cuda_graph = use_cuda_graph
+        self._preruns: int = preruns
 
         # If we got explicitly called via the old interface, raise a warning
         # and proceed with the old behavior.
@@ -262,7 +265,7 @@ class Autotuner(BaseAutotuner):
         rep=None,
         use_cuda_graph=False,
         do_bench=None,
-    ):
+    ) -> Autotuner:
         super().__init__(
             fn,
             arg_names,
@@ -352,9 +355,8 @@ class StepwiseAutotuner(BaseAutotuner):
         use_cuda_graph=False,
         do_bench=None,
         ratio: float = 1.0,
-        K: int = 1,
         delta: float = 0.05,
-    ):
+    ) -> StepwiseAutotuner:
         super().__init__(
             fn,
             arg_names,
@@ -371,11 +373,12 @@ class StepwiseAutotuner(BaseAutotuner):
             do_bench,
         )
         self._ratio: float = ratio
-        self._K: int = K
         self._delta: float = delta
         self._tcache: Dict[
             Tuple[Any], Optional[Union[Config, Dict[Config, Tuple[int, float]]]]
-        ] = defaultdict(lambda: defaultdict(lambda: (0, 0.0)))
+        ] = defaultdict(
+            lambda: defaultdict(lambda: (-self._preruns, -self.num_warmups))
+        )
 
     def run(self, *args, **kwargs):
         self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
@@ -389,18 +392,19 @@ class StepwiseAutotuner(BaseAutotuner):
             if isconfig:
                 config: Config = cache
             else:
-
-                def _filter_configs(args: Tuple[int, float, float]) -> bool:
-                    _, reward = args
-                    return reward < self.num_reps
-
                 configs: List[Config] = [
                     config
                     for config in self.prune_configs(kwargs)
                     if cache[config] is not None
                 ]
 
-                t: int = sum(cache[config][0] for config in configs)
+                t: int = sum(
+                    filter(
+                        lambda t: t >= 0,
+                        starmap(lambda t, *_: t, map(lambda c: cache[c], configs)),
+                    )
+                )
+                K: int = len(cache)
 
                 def _get_mean(n: int, reward: float) -> float:
                     return reward / n if n > 0 else 0.0
@@ -412,7 +416,7 @@ class StepwiseAutotuner(BaseAutotuner):
 
                 def _get_stop_bonus(n: int) -> float:
                     return (
-                        math.sqrt(math.log(2 * self._K * t**2 / self._delta))
+                        math.sqrt(math.log(2 * K * t**2 / self._delta))
                         if n > 0
                         else sys.float_info.max
                     )
@@ -427,7 +431,14 @@ class StepwiseAutotuner(BaseAutotuner):
                     return _get_mean(n, reward) + _get_stop_bonus(n)
 
                 candidates: List[Config] = [
-                    config for config in configs if _filter_configs(cache[config])
+                    config
+                    for config, reward in zip(
+                        configs,
+                        starmap(
+                            lambda _, reward: reward, map(lambda c: cache[c], configs)
+                        ),
+                    )
+                    if reward < self.num_reps
                 ]
 
                 if candidates:
@@ -444,9 +455,10 @@ class StepwiseAutotuner(BaseAutotuner):
                         if c != config and cache[c] is not None
                     )
                 else:
+                    div: Callable[[float, float], float] = lambda x, y: y / x
                     config = min(
                         (config for config in configs if cache[config] is not None),
-                        key=lambda c: cache[c][1],
+                        key=lambda c: div(*cache[c]),
                     )
                     isconfig = True
                 if isconfig:
@@ -486,8 +498,13 @@ class StepwiseAutotuner(BaseAutotuner):
                     self._tcache[key][config] = None
                 else:
                     n, reward = cache[config]
-                    n += 1
-                    reward += timecost
+                    if n < 0:
+                        n += 1
+                    elif reward < 0:
+                        reward += timecost
+                    else:
+                        n += 1
+                        reward += timecost
                     self._tcache[key][config] = (n, reward)
                     if os.getenv("TRITON_ENABLE_RUNTIME_MEASUREMENT", None) == "1":
                         print(
