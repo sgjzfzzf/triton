@@ -354,7 +354,6 @@ class StepwiseAutotuner(BaseAutotuner):
         ratio: float = 1.0,
         K: int = 1,
         delta: float = 0.05,
-        time_rep: float = 100.0,  # in ms
     ):
         super().__init__(
             fn,
@@ -374,7 +373,6 @@ class StepwiseAutotuner(BaseAutotuner):
         self._ratio: float = ratio
         self._K: int = K
         self._delta: float = delta
-        self._time_rep: float = time_rep
         self._tcache: Dict[
             Tuple[Any], Optional[Union[Config, Dict[Config, Tuple[int, float]]]]
         ] = defaultdict(lambda: defaultdict(lambda: (0, 0.0)))
@@ -394,7 +392,7 @@ class StepwiseAutotuner(BaseAutotuner):
 
                 def _filter_configs(args: Tuple[int, float, float]) -> bool:
                     _, reward = args
-                    return reward < self._time_rep
+                    return reward < self.num_reps
 
                 configs: List[Config] = [
                     config
