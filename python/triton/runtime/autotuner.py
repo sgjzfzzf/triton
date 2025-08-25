@@ -526,46 +526,39 @@ class UCBAutotuner(BaseAutotuner):
 
                 def _get_stop_bonus(n: int) -> float:
                     return (
-                        math.sqrt(math.log(2 * K * t**2 / self._delta))
+                        math.sqrt(math.log(2 * K * t**2 / self._delta) / (2 * n))
                         if n > 0
                         else sys.float_info.max
                     )
 
                 def _get_select_lower_boundary(n: int, reward: float) -> float:
-                    return _get_mean(n, reward) - _get_select_bonus(n)
+                    ret: float = _get_mean(n, reward)
+                    if reward <= self.reps:
+                        ret -= _get_select_bonus(n)
+                    return ret
 
                 def _get_stop_lower_boundary(n: int, reward: float) -> float:
-                    return _get_mean(n, reward) - _get_stop_bonus(n)
+                    ret: float = _get_mean(n, reward)
+                    if reward <= self.reps:
+                        ret -= _get_stop_bonus(n)
+                    return ret
 
                 def _get_stop_upper_boundary(n: int, reward: float) -> float:
-                    return _get_mean(n, reward) + _get_stop_bonus(n)
+                    ret: float = _get_mean(n, reward)
+                    if reward <= self.reps:
+                        ret += _get_stop_bonus(n)
+                    return ret
 
-                f: Callable[[float, float], float] = lambda _, reward: reward
-
-                candidates: List[Config] = [
-                    config for config in configs if f(*cache[config]) < self.reps
-                ]
-
-                if candidates:
-                    config = min(
-                        (c for c in candidates if cache[c] is not None),
-                        key=lambda c: _get_select_lower_boundary(*cache[c]),
-                    )
-                    config_upper_boundary: float = _get_stop_upper_boundary(
-                        *cache[config]
-                    )
-                    isconfig = all(
-                        _get_stop_lower_boundary(*cache[c]) >= config_upper_boundary
-                        for c in configs
-                        if c != config and cache[c] is not None
-                    )
-                else:
-                    div: Callable[[float, float], float] = lambda x, y: y / x
-                    config = min(
-                        (config for config in configs if cache[config] is not None),
-                        key=lambda c: div(*cache[c]),
-                    )
-                    isconfig = True
+                config = min(
+                    filter(lambda c: cache[c] is not None, configs),
+                    key=lambda c: _get_select_lower_boundary(*cache[c]),
+                )
+                config_upper_boundary: float = _get_stop_upper_boundary(*cache[config])
+                isconfig = all(
+                    _get_stop_lower_boundary(*cache[c]) >= config_upper_boundary
+                    for c in configs
+                    if c != config and cache[c] is not None
+                )
                 if isconfig:
                     self._tcache[key] = config
                     if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
