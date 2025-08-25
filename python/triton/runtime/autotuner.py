@@ -140,7 +140,7 @@ class BaseAutotuner(KernelInterface):
 
                 self.do_bench = lambda kernel_call, quantiles: do_bench_cudagraph(
                     kernel_call,
-                    rep=rep if rep is not None else 100,
+                    rep=self.reps,
                     quantiles=quantiles,
                 )
                 return
@@ -149,8 +149,8 @@ class BaseAutotuner(KernelInterface):
 
             self.do_bench = lambda kernel_call, quantiles: triton.testing.do_bench(
                 kernel_call,
-                warmup=warmup if warmup is not None else 25,
-                rep=rep if rep is not None else 100,
+                warmup=self.warmups,
+                rep=self.reps,
                 quantiles=quantiles,
             )
             return
@@ -159,6 +159,14 @@ class BaseAutotuner(KernelInterface):
             self.do_bench = driver.active.get_benchmarker()
         else:
             self.do_bench = do_bench
+
+    @property
+    def warmups(self) -> int:
+        return self.num_warmups if self.num_warmups is not None else 25
+
+    @property
+    def reps(self) -> int:
+        return self.num_reps if self.num_reps is not None else 100
 
     def _bench(self, *args, config, **meta):
         from ..compiler.errors import CompileTimeAssertionFailure
@@ -480,9 +488,7 @@ class UCBAutotuner(BaseAutotuner):
         self._delta: float = delta
         self._tcache: Dict[
             Tuple[Any], Optional[Union[Config, Dict[Config, Tuple[int, float]]]]
-        ] = defaultdict(
-            lambda: defaultdict(lambda: (-self._preruns, -self.num_warmups))
-        )
+        ] = defaultdict(lambda: defaultdict(lambda: (-self._preruns, -self.warmups)))
 
     def run(self, *args, **kwargs):
         self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
@@ -542,7 +548,7 @@ class UCBAutotuner(BaseAutotuner):
                             lambda _, reward: reward, map(lambda c: cache[c], configs)
                         ),
                     )
-                    if reward < self.num_reps
+                    if reward < self.reps
                 ]
 
                 if candidates:
