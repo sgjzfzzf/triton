@@ -540,15 +540,10 @@ class UCBAutotuner(BaseAutotuner):
                 def _get_stop_upper_boundary(n: int, reward: float) -> float:
                     return _get_mean(n, reward) + _get_stop_bonus(n)
 
+                f: Callable[[float, float], float] = lambda _, reward: reward
+
                 candidates: List[Config] = [
-                    config
-                    for config, reward in zip(
-                        configs,
-                        starmap(
-                            lambda _, reward: reward, map(lambda c: cache[c], configs)
-                        ),
-                    )
-                    if reward < self.reps
+                    config for config in configs if f(*cache[config]) < self.reps
                 ]
 
                 if candidates:
@@ -688,10 +683,29 @@ class ThompsonAutotuner(BaseAutotuner):
                     sigma: float = scipy.stats.invgamma.rvs(alpha, beta)
                     return scipy.stats.norm.rvs(mu, sigma / ka**0.5)
 
-                config: Config = min(
-                    filter(lambda c: cache[c] is not None, configs),
-                    key=lambda c: _sample(*cache[c]),
+                f: Callable[[float, float, float, float], float] = (
+                    lambda mu, ka, *_: mu * ka
                 )
+
+                candidates: List[Config] = [
+                    config for config in configs if f(*cache[config]) < self.reps
+                ]
+
+                if candidates:
+                    config: Config = min(
+                        filter(lambda c: cache[c] is not None, candidates),
+                        key=lambda c: _sample(*cache[c]),
+                    )
+                else:
+                    unwrap: Callable[[float, float, float, float], float] = (
+                        lambda mu, *_: mu
+                    )
+                    config: Config = min(
+                        filter(lambda c: cache[c] is not None, configs),
+                        key=lambda c: unwrap(*cache[c]),
+                    )
+                    self._tcache[key] = config
+                    isconfig = True
             if config.pre_hook is not None:
                 full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
                 config.pre_hook(full_nargs)
