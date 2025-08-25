@@ -466,7 +466,6 @@ class UCBAutotuner(BaseAutotuner):
         rep=None,
         use_cuda_graph=False,
         do_bench=None,
-        ratio: float = 1.0,
         delta: float = 0.05,
     ) -> UCBAutotuner:
         super().__init__(
@@ -484,7 +483,6 @@ class UCBAutotuner(BaseAutotuner):
             use_cuda_graph,
             do_bench,
         )
-        self._ratio: float = ratio
         self._delta: float = delta
         self._tcache: Dict[
             Tuple[Any], Optional[Union[Config, Dict[Config, Tuple[int, float]]]]
@@ -628,6 +626,7 @@ class ThompsonAutotuner(BaseAutotuner):
         rep=None,
         use_cuda_graph=False,
         do_bench=None,
+        ratio: float = 1.0,
     ):
         super().__init__(
             fn,
@@ -644,6 +643,7 @@ class ThompsonAutotuner(BaseAutotuner):
             use_cuda_graph,
             do_bench,
         )
+        self._ratio: float = ratio
         self._tcache: Dict[
             Tuple[Any],
             Dict[Config, Optional[Union[Config, Tuple[float, int, float, float]]]],
@@ -673,32 +673,47 @@ class ThompsonAutotuner(BaseAutotuner):
                     alpha: float,
                     beta: float,
                 ) -> float:
-                    sigma: float = scipy.stats.invgamma.rvs(alpha, beta)
-                    return scipy.stats.norm.rvs(mu, sigma / ka**0.5)
+                    if mu * (ka - 1) >= self.reps:
+                        return mu
+                    else:
+                        sigma: float = scipy.stats.invgamma.rvs(alpha, beta)
+                        return scipy.stats.norm.rvs(mu, sigma / ka**0.5)
 
-                f: Callable[[float, float, float, float], float] = (
-                    lambda mu, ka, *_: mu * ka
+                def _get_sigma(ka: int, alpha: float, beta: float) -> float:
+                    return scipy.stats.invgamma.mean(alpha, beta) / ka**0.5
+
+                def _get_stop_lower_boundary(
+                    mu: float, ka: int, alpha: float, beta: float
+                ) -> float:
+                    ret: float = mu
+                    if mu * (ka - 1) < self.reps:
+                        ret -= self._ratio * _get_sigma(ka, alpha, beta)
+                    return ret
+
+                def _get_stop_upper_boundary(
+                    mu: float, ka: int, alpha: float, beta: float
+                ) -> float:
+                    ret: float = mu
+                    if mu * (ka - 1) < self.reps:
+                        ret += self._ratio * _get_sigma(ka, alpha, beta)
+                    return ret
+
+                config: Config = min(
+                    filter(lambda c: cache[c] is not None, configs),
+                    key=lambda c: _sample(*cache[c]),
                 )
-
-                candidates: List[Config] = [
-                    config for config in configs if f(*cache[config]) < self.reps
-                ]
-
-                if candidates:
-                    config: Config = min(
-                        filter(lambda c: cache[c] is not None, candidates),
-                        key=lambda c: _sample(*cache[c]),
-                    )
-                else:
-                    unwrap: Callable[[float, float, float, float], float] = (
-                        lambda mu, *_: mu
-                    )
-                    config: Config = min(
-                        filter(lambda c: cache[c] is not None, configs),
-                        key=lambda c: unwrap(*cache[c]),
-                    )
+                config_upper_boundary: float = _get_stop_upper_boundary(*cache[config])
+                isconfig = all(
+                    _get_stop_lower_boundary(*cache[c]) >= config_upper_boundary
+                    for c in configs
+                    if c != config and cache[c] is not None
+                )
+                if isconfig:
                     self._tcache[key] = config
-                    isconfig = True
+                    if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
+                        print(
+                            f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` finished; best config selected: {config};"
+                        )
             if config.pre_hook is not None:
                 full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
                 config.pre_hook(full_nargs)
