@@ -382,21 +382,17 @@ class EpsilonAutotuner(BaseAutotuner):
         )
         self._epsilon: float = epsilon
         self._decay: float = decay
-        self._tcache: Dict[Tuple[Any], Tuple[Config, float, float]] = {}
+        self._tcache: Dict[Tuple[Any], Tuple[Config, float, float]] = defaultdict(
+            lambda: (None, self._epsilon, sys.float_info.max)
+        )
 
     def run(self, *args, **kwargs):
         self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
         key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
         ret = None
         while ret == None:
-            if key in self._tcache:
-                candidate, epsilon, perf = self._tcache[key]
-                is_explore: bool = random.random() < epsilon
-            else:
-                is_explore: bool = True
-                candidate: Optional[Config] = None
-                epsilon: float = self._epsilon
-                perf: float = sys.float_info.max
+            candidate, epsilon, perf = self._tcache[key]
+            is_explore: bool = random.random() < epsilon
             config: Optional[Config] = None
             if is_explore:
                 configs = [
