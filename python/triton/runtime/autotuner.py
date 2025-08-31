@@ -35,7 +35,7 @@ class BaseAutotuner(KernelInterface):
         rep=None,
         use_cuda_graph=False,
         do_bench=None,
-        preruns: int = 5,
+        preruns: int = 1,
     ) -> BaseAutotuner:
         """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
@@ -121,6 +121,9 @@ class BaseAutotuner(KernelInterface):
         self.num_reps = rep
         self.use_cuda_graph = use_cuda_graph
         self._preruns: int = preruns
+        self._enable_runtime_measurement: bool = (
+            os.getenv("TRITON_ENABLE_RUNTIME_MEASUREMENT", None) == "1"
+        )
 
         # If we got explicitly called via the old interface, raise a warning
         # and proceed with the old behavior.
@@ -162,7 +165,7 @@ class BaseAutotuner(KernelInterface):
 
     @property
     def warmups(self) -> int:
-        return self.num_warmups if self.num_warmups is not None else 25
+        return self.num_warmups if self.num_warmups is not None else 0
 
     @property
     def reps(self) -> int:
@@ -291,9 +294,6 @@ class Autotuner(BaseAutotuner):
         )
 
     def run(self, *args, **kwargs):
-        enable_runtime_measurement: bool = (
-            os.getenv("TRITON_ENABLE_RUNTIME_MEASUREMENT", None) == "1"
-        )
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
         if len(self.configs) > 1:
@@ -324,7 +324,7 @@ class Autotuner(BaseAutotuner):
         if config.pre_hook is not None:
             full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
             config.pre_hook(full_nargs)
-        if enable_runtime_measurement:
+        if self._enable_runtime_measurement:
             di = driver.active.get_device_interface()
             start_event = di.Event(enable_timing=True)
             end_event = di.Event(enable_timing=True)
@@ -334,7 +334,7 @@ class Autotuner(BaseAutotuner):
             **kwargs,
             **config.all_kwargs(),
         )
-        if enable_runtime_measurement:
+        if self._enable_runtime_measurement:
             end_event.record()
             di.synchronize()
             timecost: float = start_event.elapsed_time(end_event)
@@ -363,7 +363,7 @@ class EpsilonAutotuner(BaseAutotuner):
         use_cuda_graph=False,
         do_bench=None,
         epsilon: float = 1.0,
-        decay: float = 0.5,
+        decay: float = 0.01,
     ):
         super().__init__(
             fn,
@@ -439,7 +439,7 @@ class EpsilonAutotuner(BaseAutotuner):
                     else:
                         epsilon = epsilon * (1 - self._decay)
                     self._tcache[key] = (candidate, epsilon, perf)
-                    if os.getenv("TRITON_ENABLE_RUNTIME_MEASUREMENT", None) == "1":
+                    if self._enable_runtime_measurement:
                         print(
                             f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` on config `{config}` took {timecost}ms;"
                         )
@@ -593,12 +593,12 @@ class UCBAutotuner(BaseAutotuner):
                     if n < 0:
                         n += 1
                     elif reward < 0:
-                        reward += timecost
+                        reward = min(reward + timecost, 0)
                     else:
                         n += 1
                         reward += timecost
                     self._tcache[key][config] = (n, reward)
-                    if os.getenv("TRITON_ENABLE_RUNTIME_MEASUREMENT", None) == "1":
+                    if self._enable_runtime_measurement:
                         print(
                             f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` on config `{config}` took {timecost}ms;"
                         )
@@ -695,7 +695,7 @@ class ThompsonAutotuner(BaseAutotuner):
                     mu: float, ka: int, alpha: float, beta: float
                 ) -> float:
                     if ka <= 1.0:
-                        ret: float = -sys.float_info.max
+                        ret: float = sys.float_info.max
                     else:
                         ret: float = mu
                         if mu * (ka - 1) < self.reps:
@@ -750,18 +750,23 @@ class ThompsonAutotuner(BaseAutotuner):
                 else:
                     mu_prior, ka_prior, alpha_prior, beta_prior = cache[config]
                     ka_post = ka_prior + 1
-                    mu_post = (mu_prior * (ka_prior - 1) + timecost) / ka_prior
-                    alpha_post = alpha_prior + 0.5
-                    beta_post = beta_prior + 0.5 * (timecost - mu_prior) * (
-                        timecost - mu_post
-                    )
+                    if ka_prior <= 1.0:
+                        mu_post = mu_prior
+                        alpha_post = alpha_prior
+                        beta_post = beta_prior
+                    else:
+                        mu_post = (mu_prior * (ka_prior - 1) + timecost) / ka_prior
+                        alpha_post = alpha_prior + 0.5
+                        beta_post = beta_prior + 0.5 * (timecost - mu_prior) * (
+                            timecost - mu_post
+                        )
                     self._tcache[key][config] = (
                         mu_post,
                         ka_post,
                         alpha_post,
                         beta_post,
                     )
-                    if os.getenv("TRITON_ENABLE_RUNTIME_MEASUREMENT", None) == "1":
+                    if self._enable_runtime_measurement:
                         print(
                             f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` on config `{config}` took {timecost}ms;"
                         )
