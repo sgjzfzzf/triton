@@ -643,7 +643,7 @@ class ThompsonAutotuner(BaseAutotuner):
         self._tcache: Dict[
             Tuple[Any],
             Dict[Config, Optional[Union[Config, Tuple[float, int, float, float]]]],
-        ] = defaultdict(lambda: defaultdict(lambda: (0.0, 1, 1.0, 1.0)))
+        ] = defaultdict(lambda: defaultdict(lambda: (0.0, 1 - self._preruns, 1.0, 1.0)))
 
     def run(self, *args, **kwargs):
         self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
@@ -669,7 +669,9 @@ class ThompsonAutotuner(BaseAutotuner):
                     alpha: float,
                     beta: float,
                 ) -> float:
-                    if mu * (ka - 1) >= self.reps:
+                    if ka <= 1.0:
+                        return -sys.float_info.max
+                    elif mu * (ka - 1) >= self.reps:
                         return mu
                     else:
                         sigma: float = scipy.stats.invgamma.rvs(alpha, beta)
@@ -681,17 +683,23 @@ class ThompsonAutotuner(BaseAutotuner):
                 def _get_stop_lower_boundary(
                     mu: float, ka: int, alpha: float, beta: float
                 ) -> float:
-                    ret: float = mu
-                    if mu * (ka - 1) < self.reps:
-                        ret -= self._ratio * _get_sigma(ka, alpha, beta)
+                    if ka <= 1.0:
+                        ret: float = -sys.float_info.max
+                    else:
+                        ret: float = mu
+                        if mu * (ka - 1) < self.reps:
+                            ret -= self._ratio * _get_sigma(ka, alpha, beta)
                     return ret
 
                 def _get_stop_upper_boundary(
                     mu: float, ka: int, alpha: float, beta: float
                 ) -> float:
-                    ret: float = mu
-                    if mu * (ka - 1) < self.reps:
-                        ret += self._ratio * _get_sigma(ka, alpha, beta)
+                    if ka <= 1.0:
+                        ret: float = -sys.float_info.max
+                    else:
+                        ret: float = mu
+                        if mu * (ka - 1) < self.reps:
+                            ret += self._ratio * _get_sigma(ka, alpha, beta)
                     return ret
 
                 config: Config = min(
