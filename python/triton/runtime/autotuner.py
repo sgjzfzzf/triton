@@ -928,9 +928,21 @@ def autotune(
             "ucb": UCBAutotuner,
             "thompson": ThompsonAutotuner,
         }
+        kernel_dispatch: Dict[str, Callable] = {
+            "addmm_kernel": UCBAutotuner,
+            "bmm_kernel": UCBAutotuner,
+            "conv2d_forward_kernel": UCBAutotuner,
+            "mm_kernel": UCBAutotuner,
+            "_attn_fwd": UCBAutotuner,
+        }
         if autotune is None:
             autotune: str = os.getenv("TRITON_AUTOTUNE")
         autotuner: Callable = autotune_dispatch.get(autotune)
+        if autotuner is None:
+            base_fn = fn
+            while hasattr(base_fn, "fn"):
+                base_fn = base_fn.fn
+            autotuner = kernel_dispatch.get(base_fn.__name__, EpsilonAutotuner)
         if autotuner:
             return autotuner(
                 fn,
