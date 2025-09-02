@@ -937,12 +937,15 @@ def autotune(
         }
         if autotune is None:
             autotune: str = os.getenv("TRITON_AUTOTUNE")
-        autotuner: Callable = autotune_dispatch.get(autotune)
-        if autotuner is None:
+        if autotune == "heuristic":
             base_fn = fn
             while hasattr(base_fn, "fn"):
                 base_fn = base_fn.fn
-            autotuner = kernel_dispatch.get(base_fn.__name__, EpsilonAutotuner)
+            autotuner: Callable = kernel_dispatch.get(
+                base_fn.__name__, EpsilonAutotuner
+            )
+        else:
+            autotuner: Callable = autotune_dispatch.get(autotune)
         if autotuner:
             return autotuner(
                 fn,
