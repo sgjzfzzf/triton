@@ -2,15 +2,15 @@ from __future__ import annotations
 from abc import abstractmethod
 
 import builtins
+import enum
+import numpy as np
 import os
 import time
 import inspect
 import random
 import scipy.stats
 import sys
-import math
 from collections import defaultdict
-from itertools import starmap
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .jit import KernelInterface
@@ -481,88 +481,74 @@ class UCBAutotuner(BaseAutotuner):
         )
         self._delta: float = delta
         self._tcache: Dict[
-            Tuple[Any], Optional[Union[Config, Dict[Config, Tuple[int, float]]]]
-        ] = defaultdict(lambda: defaultdict(lambda: (-self._preruns, -self.warmups)))
+            Tuple[Any],
+            Tuple[
+                List[Config],
+                Union[Dict[Config, int], Tuple[np.ndarray, np.ndarray], Config],
+            ],
+        ] = {}
 
     def run(self, *args, **kwargs):
         self.nargs: Dict[str, Any] = dict(zip(self.arg_names, args))
         key: Tuple[Any] = self._get_key({**self.nargs, **kwargs})
-        cache: Optional[Union[Config, Dict[Config, Tuple[int, float]]]] = self._tcache[
-            key
-        ]
+        result: Optional[
+            Tuple[
+                List[Config],
+                Union[Dict[Config, int], Tuple[np.ndarray, np.ndarray], Config],
+            ]
+        ] = self._tcache.get(key)
+        if result is None:
+            candidates: List[Config] = self.prune_configs(kwargs)
+            cache: Dict[Config, int] = {
+                candidate: self._preruns for candidate in candidates
+            }
+        else:
+            candidates, cache = result
         ret = None
         while ret == None:
-            isconfig: bool = isinstance(cache, Config)
-            if isconfig:
+            if isinstance(cache, dict):
+                if not cache:
+                    config: Config = random.choice(candidates)
+                    length: int = len(candidates)
+                    ns: np.ndarray = np.zeros(length, dtype=np.int64)
+                    rewards: np.ndarray = np.zeros(length, dtype=np.float32)
+                    idx: int = candidates.index(config)
+                    cache: Tuple[np.ndarray, np.ndarray] = (ns, rewards)
+                else:
+                    config: Config = random.choice(list(cache.keys()))
+                    remain: int = cache[config] - 1
+                    if remain == 0:
+                        cache.pop(config)
+                    else:
+                        cache[config] = remain
+            elif isinstance(cache, tuple):
+                ns, rewards = cache
+                K: int = len(candidates)
+                t: np.ndarray = sum(rewards)
+                means: np.ndarray = np.where(ns > 0, rewards / ns, 0.0)
+                select_bonus: np.ndarray = np.select(
+                    [ns <= 0, rewards >= self.reps],
+                    [sys.float_info.max, 0],
+                    np.sqrt(2 * np.log(t) / ns),
+                )
+                stop_bonus: np.ndarray = np.select(
+                    [ns <= 0, rewards >= self.reps],
+                    [sys.float_info.max, 0],
+                    np.sqrt(np.log(2 * K * t**2 / self._delta) / (2 * ns)),
+                )
+                idx: int = np.argmin(means - select_bonus)
+                ucb: float = means[idx] + stop_bonus[idx]
+                lcbs: np.ndarray = means - stop_bonus
+                lcbs[idx] = sys.float_info.max
+                config: Config = candidates[idx]
+                if np.all(ucb < lcbs):
+                    cache = config
+            elif isinstance(cache, Config):
                 config: Config = cache
-            else:
-                configs: List[Config] = [
-                    config
-                    for config in self.prune_configs(kwargs)
-                    if cache[config] is not None
-                ]
-
-                t: int = sum(
-                    filter(
-                        lambda t: t >= 0,
-                        starmap(lambda t, *_: t, map(lambda c: cache[c], configs)),
-                    )
-                )
-                K: int = len(cache)
-
-                def _get_mean(n: int, reward: float) -> float:
-                    return reward / n if n > 0 else 0.0
-
-                def _get_select_bonus(n: int) -> float:
-                    return (
-                        math.sqrt(2 * math.log(t) / n) if n > 0 else sys.float_info.max
-                    )
-
-                def _get_stop_bonus(n: int) -> float:
-                    return (
-                        math.sqrt(math.log(2 * K * t**2 / self._delta) / (2 * n))
-                        if n > 0
-                        else sys.float_info.max
-                    )
-
-                def _get_select_lower_boundary(n: int, reward: float) -> float:
-                    ret: float = _get_mean(n, reward)
-                    if reward <= self.reps:
-                        ret -= _get_select_bonus(n)
-                    return ret
-
-                def _get_stop_lower_boundary(n: int, reward: float) -> float:
-                    ret: float = _get_mean(n, reward)
-                    if reward <= self.reps:
-                        ret -= _get_stop_bonus(n)
-                    return ret
-
-                def _get_stop_upper_boundary(n: int, reward: float) -> float:
-                    ret: float = _get_mean(n, reward)
-                    if reward <= self.reps:
-                        ret += _get_stop_bonus(n)
-                    return ret
-
-                config = min(
-                    filter(lambda c: cache[c] is not None, configs),
-                    key=lambda c: _get_select_lower_boundary(*cache[c]),
-                )
-                config_upper_boundary: float = _get_stop_upper_boundary(*cache[config])
-                isconfig = all(
-                    _get_stop_lower_boundary(*cache[c]) >= config_upper_boundary
-                    for c in configs
-                    if c != config and cache[c] is not None
-                )
-                if isconfig:
-                    self._tcache[key] = config
-                    if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
-                        print(
-                            f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` finished; best config selected: {config};"
-                        )
             if config.pre_hook is not None:
                 full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
                 config.pre_hook(full_nargs)
-            if not isconfig:
+            if isinstance(cache, tuple):
                 di = driver.active.get_device_interface()
                 start_event = di.Event(enable_timing=True)
                 end_event = di.Event(enable_timing=True)
@@ -581,27 +567,23 @@ class UCBAutotuner(BaseAutotuner):
                     print(
                         f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` failed on config `{config}` with args `{args_display}`"
                     )
+                candidates.remove(config)
+                if config in cache:
+                    cache.pop(config)
                 ret = None
-            if not isconfig:
+            if isinstance(cache, tuple):
                 end_event.record()
                 di.synchronize()
                 timecost: float = start_event.elapsed_time(end_event)
-                if ret is None:
-                    self._tcache[key][config] = None
-                else:
-                    n, reward = cache[config]
-                    if n < 0:
-                        n += 1
-                    elif reward < 0:
-                        reward = min(reward + timecost, 0)
-                    else:
-                        n += 1
-                        reward += timecost
-                    self._tcache[key][config] = (n, reward)
+                if ret is not None:
+                    ns[idx] += 1
+                    rewards[idx] += timecost
+                    cache = (ns, rewards)
                     if self._enable_runtime_measurement:
                         print(
                             f"Triton autotuning for function `{self.base_fn.__name__}` with `{key}` on config `{config}` took {timecost}ms;"
                         )
+            self._tcache[key] = (candidates, cache)
         self.nargs = None
         return ret
 
