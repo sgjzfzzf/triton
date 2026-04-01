@@ -466,6 +466,9 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     Value threadPred =
         emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
     uint32_t regMask = freeVarMasks[str_attr("reg")];
+    auto funcOp = op->getParentOfType<FunctionOpInterface>();
+    const bool enableAddrPrint =
+        funcOp && funcOp.getName() == "act_quant_triton_kernel";
 
     const int numVecs = elemsPerThread / vec;
     for (size_t vecStart = 0; vecStart < elemsPerThread; vecStart += vec) {
@@ -546,13 +549,41 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
       if (l2PolicyReg)
         evictOpr = ptxBuilder.newOperand(l2PolicyReg, "l");
 
-      if (!evictOpr)
-        ptxStoreInstr(asmAddr, asmArgList).maybePredicate(pred, "b");
-      else
-        ptxStoreInstr(asmAddr, asmArgList, evictOpr).maybePredicate(pred, "b");
+      auto emitStoreWithAddrPrint = [&]() {
+        if (enableAddrPrint) {
+          // Print the destination address for each emitted st.global.
+          Value addrToPrint = b.ptrtoint(i64_ty, ptrElems[vecStart]);
+          targetInfo.printf(rewriter, "st.global addr=0x%llx", {addrToPrint},
+                            {false});
+        }
 
-      auto asmReturnTy = void_ty(ctx);
-      ptxBuilder.launch(rewriter, loc, asmReturnTy);
+        if (!evictOpr)
+          ptxStoreInstr(asmAddr, asmArgList).maybePredicate(pred, "b");
+        else
+          ptxStoreInstr(asmAddr, asmArgList, evictOpr)
+              .maybePredicate(pred, "b");
+
+        auto asmReturnTy = void_ty(ctx);
+        ptxBuilder.launch(rewriter, loc, asmReturnTy);
+      };
+
+      if (pred) {
+        auto *curBlock = rewriter.getInsertionBlock();
+        auto *endBlock = curBlock->splitBlock(rewriter.getInsertionPoint());
+        auto *storeBlock = rewriter.createBlock(
+            curBlock->getParent(), std::next(Region::iterator(curBlock)));
+
+        rewriter.setInsertionPointToEnd(curBlock);
+        LLVM::CondBrOp::create(rewriter, loc, pred, storeBlock, endBlock);
+
+        rewriter.setInsertionPointToEnd(storeBlock);
+        emitStoreWithAddrPrint();
+        LLVM::BrOp::create(rewriter, loc, endBlock);
+
+        rewriter.setInsertionPointToStart(endBlock);
+      } else {
+        emitStoreWithAddrPrint();
+      }
     }
     rewriter.eraseOp(op);
     return success();
